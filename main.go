@@ -9,6 +9,7 @@ import (
 
 	"github.com/chris/termbrowser/auth"
 	"github.com/chris/termbrowser/config"
+	"github.com/chris/termbrowser/containers"
 	"github.com/chris/termbrowser/server"
 	"github.com/chris/termbrowser/terminal"
 
@@ -44,7 +45,14 @@ func main() {
 	}
 
 	authMgr := auth.NewManager(cfg.PasswordHash, cfg.TOTPSecret, jwtSecret)
-	termMgr := terminal.NewManager()
+	termMgr := terminal.NewManager(func(name string) string {
+		addrs, err := containers.NodeAddresses()
+		if err != nil {
+			log.Printf("resolving node %q: %v", name, err)
+			return ""
+		}
+		return addrs[name]
+	})
 
 	webRoot, err := fs.Sub(webFiles, "web")
 	if err != nil {

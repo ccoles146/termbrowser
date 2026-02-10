@@ -194,10 +194,19 @@ function initTerminal() {
     // refers to the current connection without accumulating extra listeners.
     term.onData(data => {
         if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(new TextEncoder().encode(data));
+            // Filter terminal query responses (DA1/DA2) that xterm.js emits
+            // in response to escape sequences from the server. Without this,
+            // responses like ESC[?0;276;0c leak back to the PTY as garbage.
+            const filtered = data.replace(/\x1b\[[\?>\d;]*c/g, '');
+            if (filtered) {
+                ws.send(new TextEncoder().encode(filtered));
+            }
         }
     });
 
+    // Remove any previously registered listener to prevent accumulation
+    // across multiple initTerminal() calls (e.g. login → logout → login).
+    window.removeEventListener('resize', onWindowResize);
     window.addEventListener('resize', onWindowResize);
 }
 
@@ -219,7 +228,9 @@ function sendResize() {
 
 function disconnectTerminal() {
     if (ws) {
+        ws.onmessage = null;
         ws.onclose = null;
+        ws.onerror = null;
         ws.close();
         ws = null;
     }
@@ -230,7 +241,15 @@ function connectTerminal(id) {
     currentId = id;
     setActiveItem(id);
 
-    const label = id === 'host' ? 'Proxmox Host' : 'Container ' + id;
+    let label;
+    if (id === 'host') {
+        label = 'Proxmox Host';
+    } else if (id.startsWith('node:')) {
+        label = 'Node ' + id.slice(5);
+    } else {
+        const item = document.querySelector('.sidebar-item[data-id="' + id + '"] .item-name');
+        label = item ? item.textContent : id;
+    }
     terminalTitle.textContent = label;
 
     if (term) {

@@ -20,21 +20,29 @@ type resizeMsg struct {
 	Rows uint16 `json:"rows"`
 }
 
+// NodeResolver maps a Proxmox node name to a routable address (IP or FQDN).
+// It is called when building SSH commands for remote nodes/containers.
+type NodeResolver func(name string) string
+
 type Session struct {
 	id   string
 	cmd  *exec.Cmd
 	ptmx *os.File
+
 	mu   sync.Mutex
+	conn *websocket.Conn // current active WebSocket, guarded by mu
 }
 
 type Manager struct {
-	mu       sync.RWMutex
-	sessions map[string]*Session
+	mu          sync.RWMutex
+	sessions    map[string]*Session
+	resolveNode NodeResolver
 }
 
-func NewManager() *Manager {
+func NewManager(resolve NodeResolver) *Manager {
 	return &Manager{
-		sessions: make(map[string]*Session),
+		sessions:    make(map[string]*Session),
+		resolveNode: resolve,
 	}
 }
 
@@ -51,7 +59,18 @@ func buildEnv() []string {
 	return append(env, "TERM=xterm-256color")
 }
 
-func buildCommand(id string) *exec.Cmd {
+// nodeAddr resolves a Proxmox node name to a routable address.
+// Falls back to the raw name if no resolver is set or lookup fails.
+func (m *Manager) nodeAddr(name string) string {
+	if m.resolveNode != nil {
+		if addr := m.resolveNode(name); addr != "" {
+			return addr
+		}
+	}
+	return name
+}
+
+func (m *Manager) buildCommand(id string) *exec.Cmd {
 	var cmd *exec.Cmd
 	switch {
 	case id == "host":
@@ -59,8 +78,9 @@ func buildCommand(id string) *exec.Cmd {
 
 	case strings.HasPrefix(id, "node:"):
 		node := id[5:]
+		addr := m.nodeAddr(node)
 		session := "tb-" + strings.ReplaceAll(node, ".", "-")
-		cmd = exec.Command("ssh", "-tt", "-o", "StrictHostKeyChecking=no", "root@"+node,
+		cmd = exec.Command("ssh", "-tt", "-o", "StrictHostKeyChecking=no", "root@"+addr,
 			"env", "TERM=xterm-256color",
 			"tmux", "new-session", "-A", "-s", session, "--", "/bin/bash")
 
@@ -68,7 +88,8 @@ func buildCommand(id string) *exec.Cmd {
 		// Format: lxc/{node}/{vmid}
 		parts := strings.SplitN(id[4:], "/", 2)
 		node, vmid := parts[0], parts[1]
-		cmd = exec.Command("ssh", "-tt", "-o", "StrictHostKeyChecking=no", "root@"+node,
+		addr := m.nodeAddr(node)
+		cmd = exec.Command("ssh", "-tt", "-o", "StrictHostKeyChecking=no", "root@"+addr,
 			"pct", "exec", vmid, "--",
 			"env", "TERM=xterm-256color",
 			"tmux", "new-session", "-A", "-s", "tb-"+vmid, "--", "/bin/bash")
@@ -77,7 +98,8 @@ func buildCommand(id string) *exec.Cmd {
 		// Format: qemu/{node}/{vmid} — serial console via qm terminal
 		parts := strings.SplitN(id[5:], "/", 2)
 		node, vmid := parts[0], parts[1]
-		cmd = exec.Command("ssh", "-tt", "-o", "StrictHostKeyChecking=no", "root@"+node,
+		addr := m.nodeAddr(node)
+		cmd = exec.Command("ssh", "-tt", "-o", "StrictHostKeyChecking=no", "root@"+addr,
 			"qm", "terminal", vmid, "-iface", "serial0")
 
 	default:
@@ -95,7 +117,6 @@ func isAlive(s *Session) bool {
 	if s.cmd.Process == nil {
 		return false
 	}
-	// Signal 0 checks if process exists without delivering a real signal
 	err := s.cmd.Process.Signal(syscall.Signal(0))
 	return err == nil
 }
@@ -118,7 +139,7 @@ func (m *Manager) GetOrCreate(id string) (*Session, error) {
 		return s, nil
 	}
 
-	cmd := buildCommand(id)
+	cmd := m.buildCommand(id)
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		return nil, fmt.Errorf("starting pty for %s: %w", id, err)
@@ -131,6 +152,31 @@ func (m *Manager) GetOrCreate(id string) (*Session, error) {
 	}
 	m.sessions[id] = s
 
+	// Persistent PTY reader: reads from PTY and writes to whatever
+	// WebSocket connection is currently active. This goroutine lives
+	// for the lifetime of the session, preventing duplicate readers
+	// when clients reconnect.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := s.ptmx.Read(buf)
+			if n > 0 {
+				s.mu.Lock()
+				if s.conn != nil {
+					if werr := s.conn.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
+						// Write failed; conn will be replaced on next connect.
+						s.conn = nil
+					}
+				}
+				s.mu.Unlock()
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Cleanup: remove session from map when process exits.
 	go func() {
 		cmd.Wait()
 		ptmx.Close()
@@ -153,28 +199,17 @@ func (m *Manager) ServeWebSocket(conn *websocket.Conn, id string) {
 		return
 	}
 
-	// PTY reader goroutine: send output to WebSocket
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		buf := make([]byte, 4096)
-		for {
-			n, err := s.ptmx.Read(buf)
-			if n > 0 {
-				s.mu.Lock()
-				werr := conn.WriteMessage(websocket.BinaryMessage, buf[:n])
-				s.mu.Unlock()
-				if werr != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
+	// Swap in the new connection; close the old one so its client-side
+	// onmessage handler stops firing (prevents duplicate output).
+	s.mu.Lock()
+	old := s.conn
+	s.conn = conn
+	s.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
 
-	// WebSocket reader: forward input to PTY or handle resize
+	// Read input from this WebSocket and forward to PTY.
 	for {
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
@@ -194,5 +229,10 @@ func (m *Manager) ServeWebSocket(conn *websocket.Conn, id string) {
 		}
 	}
 
-	<-done
+	// If we're still the active connection, nil it out.
+	s.mu.Lock()
+	if s.conn == conn {
+		s.conn = nil
+	}
+	s.mu.Unlock()
 }
