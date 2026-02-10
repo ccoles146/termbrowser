@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>termbrowser</title>
+    <link rel="stylesheet" href="xterm.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Login Screen -->
+<div id="login-screen">
+    <div class="login-card">
+        <h1>termbrowser</h1>
+        <p class="subtitle">Proxmox terminal access</p>
+        <form id="login-form" autocomplete="off">
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" autofocus required>
+            </div>
+            <div class="form-group">
+                <label for="totp">Authenticator Code</label>
+                <input type="text" id="totp" name="totp" inputmode="numeric" maxlength="6" placeholder="000000" required>
+            </div>
+            <button type="submit" class="btn-login">Sign In</button>
+            <div class="login-error" id="login-error"></div>
+        </form>
+    </div>
+</div>
+
+<!-- App Screen -->
+<div id="app-screen">
+    <div id="sidebar">
+        <div class="sidebar-header">
+            <h2>termbrowser</h2>
+            <button class="btn-logout" id="btn-logout">logout</button>
+        </div>
+        <div class="sidebar-items" id="sidebar-items">
+            <!-- populated by JS -->
+        </div>
+    </div>
+    <div id="terminal-area">
+        <div id="terminal-header">
+            <span>terminal &gt;</span>
+            <span id="terminal-title">not connected</span>
+        </div>
+        <div id="terminal-container"></div>
+    </div>
+</div>
+
+<script src="xterm.js"></script>
+<script src="addon-fit.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
