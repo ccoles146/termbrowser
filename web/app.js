@@ -88,30 +88,31 @@ function renderSidebar(items) {
     sidebarItems.appendChild(hostEl);
 
     const nodes = (items || []).filter(c => c.type === 'node');
-    const ctrs = (items || []).filter(c => c.type !== 'node');
+    const lxcs  = (items || []).filter(c => c.type === 'lxc');
+    const vms   = (items || []).filter(c => c.type === 'qemu');
 
-    // Nodes section
-    if (nodes.length > 0) {
-        const label = document.createElement('div');
-        label.className = 'sidebar-section-label';
-        label.textContent = 'Nodes';
-        sidebarItems.appendChild(label);
-        nodes.forEach(c => {
-            const el = makeSidebarItem(c.ctid, c.name || c.ctid, c.status, null);
-            sidebarItems.appendChild(el);
-        });
+    function appendSection(label, list) {
+        const labelEl = document.createElement('div');
+        labelEl.className = 'sidebar-section-label';
+        labelEl.textContent = label;
+        sidebarItems.appendChild(labelEl);
+        list.forEach(c => sidebarItems.appendChild(c));
     }
 
-    // Containers section
-    if (ctrs.length > 0) {
-        const label = document.createElement('div');
-        label.className = 'sidebar-section-label';
-        label.textContent = 'Containers';
-        sidebarItems.appendChild(label);
-        ctrs.forEach(c => {
-            const el = makeSidebarItem(c.ctid, c.name || c.ctid, c.status, c.ctid);
-            sidebarItems.appendChild(el);
-        });
+    if (nodes.length > 0) {
+        appendSection('Nodes', nodes.map(c =>
+            makeSidebarItem(c.ctid, c.name || c.ctid, c.status, null)
+        ));
+    }
+    if (lxcs.length > 0) {
+        appendSection('Containers', lxcs.map(c =>
+            makeSidebarItem(c.ctid, c.name || c.vmid || c.ctid, c.status, c.vmid || c.ctid)
+        ));
+    }
+    if (vms.length > 0) {
+        appendSection('Virtual Machines', vms.map(c =>
+            makeSidebarItem(c.ctid, c.name || c.vmid || c.ctid, c.status, c.vmid || c.ctid)
+        ));
     }
 }
 
@@ -189,6 +190,14 @@ function initTerminal() {
     term.open(terminalContainer);
     fitAddon.fit();
 
+    // Register input handler once — ws is a module-level variable so it always
+    // refers to the current connection without accumulating extra listeners.
+    term.onData(data => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(new TextEncoder().encode(data));
+        }
+    });
+
     window.addEventListener('resize', onWindowResize);
 }
 
@@ -236,15 +245,6 @@ function connectTerminal(id) {
 
     ws.onopen = () => {
         sendResize();
-        if (term) {
-            term.onData(data => {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    // Send keyboard input as binary
-                    const encoded = new TextEncoder().encode(data);
-                    ws.send(encoded);
-                }
-            });
-        }
     };
 
     ws.onmessage = (event) => {

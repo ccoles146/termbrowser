@@ -42,7 +42,8 @@ func (s *Server) Run() error {
 	mux.HandleFunc("POST /api/login", s.handleLogin)
 	mux.HandleFunc("POST /api/logout", s.handleLogout)
 	mux.Handle("GET /api/containers", s.auth.Middleware(http.HandlerFunc(s.handleContainers)))
-	mux.Handle("GET /ws/terminal/{id}", s.auth.Middleware(http.HandlerFunc(s.handleTerminal)))
+	// {id...} captures the full remaining path so IDs like "lxc/pve/100" work.
+	mux.Handle("GET /ws/terminal/{id...}", s.auth.Middleware(http.HandlerFunc(s.handleTerminal)))
 	mux.Handle("/", http.FileServer(http.FS(s.webRoot)))
 
 	addr := net.JoinHostPort("", strconv.Itoa(s.cfg.Port))
@@ -80,31 +81,46 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
-	nodes, err := containers.ListNodes()
+	all, err := containers.ListAll()
 	if err != nil {
-		log.Printf("listing nodes: %v", err)
+		log.Printf("listing resources: %v", err)
+		all = []containers.Container{}
 	}
-
-	ctrs, err := containers.List()
-	if err != nil {
-		log.Printf("listing containers: %v", err)
-	}
-
-	all := make([]containers.Container, 0, len(nodes)+len(ctrs))
-	all = append(all, nodes...)
-	all = append(all, ctrs...)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(all)
 }
 
+// validID returns true for the terminal ID formats we accept:
+//
+//	"host"            — the Proxmox host itself
+//	"node:{name}"     — SSH into a cluster node
+//	"lxc/{node}/{id}" — LXC container via pct exec over SSH
+//	"qemu/{node}/{id}"— QEMU VM via qm terminal over SSH
+//	"{digits}"        — legacy: local LXC by bare numeric ctid
+func validID(id string) bool {
+	switch {
+	case id == "host":
+		return true
+	case strings.HasPrefix(id, "node:"):
+		return len(id) > 5
+	case strings.HasPrefix(id, "lxc/"):
+		parts := strings.SplitN(id[4:], "/", 2)
+		return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+	case strings.HasPrefix(id, "qemu/"):
+		parts := strings.SplitN(id[5:], "/", 2)
+		return len(parts) == 2 && parts[0] != "" && parts[1] != ""
+	default:
+		_, err := strconv.Atoi(id)
+		return err == nil
+	}
+}
+
 func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if id != "host" && !strings.HasPrefix(id, "node:") {
-		if _, err := strconv.Atoi(id); err != nil {
-			http.Error(w, "invalid terminal id", http.StatusBadRequest)
-			return
-		}
+	if !validID(id) {
+		http.Error(w, "invalid terminal id", http.StatusBadRequest)
+		return
 	}
 
 	conn, err := s.upgrader.Upgrade(w, r, nil)

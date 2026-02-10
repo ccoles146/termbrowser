@@ -38,22 +38,56 @@ func NewManager() *Manager {
 	}
 }
 
+// buildEnv returns os.Environ() with any existing TERM removed, then
+// TERM=xterm-256color appended. On Linux, getenv() returns the first
+// match, so duplicate TERM entries would silently override our value.
+func buildEnv() []string {
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, e := range os.Environ() {
+		if !strings.HasPrefix(e, "TERM=") {
+			env = append(env, e)
+		}
+	}
+	return append(env, "TERM=xterm-256color")
+}
+
 func buildCommand(id string) *exec.Cmd {
 	var cmd *exec.Cmd
-	if id == "host" {
+	switch {
+	case id == "host":
 		cmd = exec.Command("tmux", "new-session", "-A", "-s", "tb-host", "--", "/bin/bash")
-	} else if strings.HasPrefix(id, "node:") {
+
+	case strings.HasPrefix(id, "node:"):
 		node := id[5:]
 		session := "tb-" + strings.ReplaceAll(node, ".", "-")
 		cmd = exec.Command("ssh", "-tt", "-o", "StrictHostKeyChecking=no", "root@"+node,
 			"env", "TERM=xterm-256color",
 			"tmux", "new-session", "-A", "-s", session, "--", "/bin/bash")
-	} else {
+
+	case strings.HasPrefix(id, "lxc/"):
+		// Format: lxc/{node}/{vmid}
+		parts := strings.SplitN(id[4:], "/", 2)
+		node, vmid := parts[0], parts[1]
+		cmd = exec.Command("ssh", "-tt", "-o", "StrictHostKeyChecking=no", "root@"+node,
+			"pct", "exec", vmid, "--",
+			"env", "TERM=xterm-256color",
+			"tmux", "new-session", "-A", "-s", "tb-"+vmid, "--", "/bin/bash")
+
+	case strings.HasPrefix(id, "qemu/"):
+		// Format: qemu/{node}/{vmid} — serial console via qm terminal
+		parts := strings.SplitN(id[5:], "/", 2)
+		node, vmid := parts[0], parts[1]
+		cmd = exec.Command("ssh", "-tt", "-o", "StrictHostKeyChecking=no", "root@"+node,
+			"qm", "terminal", vmid, "-iface", "serial0")
+
+	default:
+		// Legacy: bare numeric ctid for local LXC container
 		cmd = exec.Command("pct", "exec", id, "--",
 			"env", "TERM=xterm-256color",
 			"tmux", "new-session", "-A", "-s", "tb-"+id, "--", "/bin/bash")
 	}
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+
+	cmd.Env = buildEnv()
 	return cmd
 }
 
