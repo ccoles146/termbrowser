@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -38,10 +39,22 @@ func NewManager() *Manager {
 }
 
 func buildCommand(id string) *exec.Cmd {
+	var cmd *exec.Cmd
 	if id == "host" {
-		return exec.Command("tmux", "new-session", "-A", "-s", "tb-host", "--", "/bin/bash")
+		cmd = exec.Command("tmux", "new-session", "-A", "-s", "tb-host", "--", "/bin/bash")
+	} else if strings.HasPrefix(id, "node:") {
+		node := id[5:]
+		session := "tb-" + strings.ReplaceAll(node, ".", "-")
+		cmd = exec.Command("ssh", "-tt", "-o", "StrictHostKeyChecking=no", "root@"+node,
+			"env", "TERM=xterm-256color",
+			"tmux", "new-session", "-A", "-s", session, "--", "/bin/bash")
+	} else {
+		cmd = exec.Command("pct", "exec", id, "--",
+			"env", "TERM=xterm-256color",
+			"tmux", "new-session", "-A", "-s", "tb-"+id, "--", "/bin/bash")
 	}
-	return exec.Command("pct", "exec", id, "--", "tmux", "new-session", "-A", "-s", "tb-"+id, "--", "/bin/bash")
+	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	return cmd
 }
 
 func isAlive(s *Session) bool {

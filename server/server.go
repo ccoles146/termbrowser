@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/chris/termbrowser/auth"
 	"github.com/chris/termbrowser/config"
@@ -79,19 +80,27 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleContainers(w http.ResponseWriter, r *http.Request) {
-	list, err := containers.List()
+	nodes, err := containers.ListNodes()
+	if err != nil {
+		log.Printf("listing nodes: %v", err)
+	}
+
+	ctrs, err := containers.List()
 	if err != nil {
 		log.Printf("listing containers: %v", err)
-		// Return empty list rather than error — host may not have pct
-		list = nil
 	}
+
+	all := make([]containers.Container, 0, len(nodes)+len(ctrs))
+	all = append(all, nodes...)
+	all = append(all, ctrs...)
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(list)
+	json.NewEncoder(w).Encode(all)
 }
 
 func (s *Server) handleTerminal(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if id != "host" {
+	if id != "host" && !strings.HasPrefix(id, "node:") {
 		if _, err := strconv.Atoi(id); err != nil {
 			http.Error(w, "invalid terminal id", http.StatusBadRequest)
 			return

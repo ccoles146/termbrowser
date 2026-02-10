@@ -80,24 +80,35 @@ function showApp(containers) {
     connectTerminal('host');
 }
 
-function renderSidebar(containers) {
+function renderSidebar(items) {
     sidebarItems.innerHTML = '';
 
     // Host entry (always first)
     const hostEl = makeSidebarItem('host', 'Proxmox Host', 'running', null);
     sidebarItems.appendChild(hostEl);
 
-    // Separator label if there are containers
-    if (containers && containers.length > 0) {
+    const nodes = (items || []).filter(c => c.type === 'node');
+    const ctrs = (items || []).filter(c => c.type !== 'node');
+
+    // Nodes section
+    if (nodes.length > 0) {
+        const label = document.createElement('div');
+        label.className = 'sidebar-section-label';
+        label.textContent = 'Nodes';
+        sidebarItems.appendChild(label);
+        nodes.forEach(c => {
+            const el = makeSidebarItem(c.ctid, c.name || c.ctid, c.status, null);
+            sidebarItems.appendChild(el);
+        });
+    }
+
+    // Containers section
+    if (ctrs.length > 0) {
         const label = document.createElement('div');
         label.className = 'sidebar-section-label';
         label.textContent = 'Containers';
         sidebarItems.appendChild(label);
-    }
-
-    // Container entries
-    if (containers) {
-        containers.forEach(c => {
+        ctrs.forEach(c => {
             const el = makeSidebarItem(c.ctid, c.name || c.ctid, c.status, c.ctid);
             sidebarItems.appendChild(el);
         });
@@ -105,12 +116,13 @@ function renderSidebar(containers) {
 }
 
 function makeSidebarItem(id, name, status, ctid) {
+    const isActive = status === 'running' || status === 'online';
     const el = document.createElement('div');
-    el.className = 'sidebar-item' + (status !== 'running' ? ' stopped' : '');
+    el.className = 'sidebar-item' + (isActive ? '' : ' stopped');
     el.dataset.id = id;
 
     const dot = document.createElement('span');
-    dot.className = 'status-dot ' + (status === 'running' ? 'running' : 'stopped');
+    dot.className = 'status-dot ' + (isActive ? 'running' : 'stopped');
     el.appendChild(dot);
 
     const nameEl = document.createElement('span');
