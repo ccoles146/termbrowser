@@ -199,8 +199,11 @@ function initTerminal() {
             // responses like ESC[?0;276;0c leak back to the PTY as garbage.
             const filtered = data.replace(/\x1b\[[\?>\d;]*c/g, '');
             if (filtered) {
+                console.log(`[INPUT] sending ${filtered.length} byte(s) via WS#${ws._seq} to ${currentId}`);
                 ws.send(new TextEncoder().encode(filtered));
             }
+        } else {
+            console.warn(`[INPUT] dropped ${data.length} byte(s): ws=${ws ? 'exists' : 'null'} readyState=${ws ? ws.readyState : 'N/A'}`);
         }
     });
 
@@ -226,8 +229,11 @@ function sendResize() {
     }
 }
 
+let wsSeq = 0; // client-side WebSocket sequence counter
+
 function disconnectTerminal() {
     if (ws) {
+        console.log(`[WS] disconnectTerminal: closing WS#${ws._seq} for ${currentId}`);
         ws.onmessage = null;
         ws.onclose = null;
         ws.onerror = null;
@@ -237,6 +243,7 @@ function disconnectTerminal() {
 }
 
 function connectTerminal(id) {
+    console.log(`[WS] connectTerminal(${id}): starting`);
     disconnectTerminal();
     currentId = id;
     setActiveItem(id);
@@ -257,12 +264,17 @@ function connectTerminal(id) {
         term.write('\x1b[?25h'); // show cursor
     }
 
+    wsSeq++;
+    const mySeq = wsSeq;
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const url = `${proto}://${location.host}/ws/terminal/${id}`;
+    console.log(`[WS] connectTerminal(${id}): creating WS#${mySeq} → ${url}`);
     ws = new WebSocket(url);
+    ws._seq = mySeq;
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
+        console.log(`[WS] WS#${mySeq} (${id}): onopen`);
         sendResize();
     };
 
@@ -275,13 +287,15 @@ function connectTerminal(id) {
         }
     };
 
-    ws.onerror = () => {
+    ws.onerror = (e) => {
+        console.error(`[WS] WS#${mySeq} (${id}): onerror`, e);
         if (term) {
             term.write('\r\n\x1b[31mConnection error.\x1b[0m\r\n');
         }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (e) => {
+        console.log(`[WS] WS#${mySeq} (${id}): onclose code=${e.code} reason=${e.reason} currentId=${currentId}`);
         if (term && currentId === id) {
             term.write('\r\n\x1b[33m[disconnected]\x1b[0m\r\n');
         }

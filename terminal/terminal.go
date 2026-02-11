@@ -25,18 +25,21 @@ type resizeMsg struct {
 type NodeResolver func(name string) string
 
 type Session struct {
-	id   string
-	cmd  *exec.Cmd
-	ptmx *os.File
+	id    string
+	seqNo int // unique session sequence number for logging
+	cmd   *exec.Cmd
+	ptmx  *os.File
 
 	mu   sync.Mutex
 	conn *websocket.Conn // current active WebSocket, guarded by mu
+	connSeq int          // incremented on each WebSocket swap
 }
 
 type Manager struct {
 	mu          sync.RWMutex
 	sessions    map[string]*Session
 	resolveNode NodeResolver
+	nextSeq     int // global session sequence counter
 }
 
 func NewManager(resolve NodeResolver) *Manager {
@@ -115,9 +118,14 @@ func (m *Manager) buildCommand(id string) *exec.Cmd {
 
 func isAlive(s *Session) bool {
 	if s.cmd.Process == nil {
+		log.Printf("[SESSION] isAlive S%d (%q): Process is nil → false", s.seqNo, s.id)
 		return false
 	}
 	err := s.cmd.Process.Signal(syscall.Signal(0))
+	if err != nil {
+		log.Printf("[SESSION] isAlive S%d (%q): Signal(0) to pid %d failed: %v → false",
+			s.seqNo, s.id, s.cmd.Process.Pid, err)
+	}
 	return err == nil
 }
 
@@ -126,8 +134,16 @@ func (m *Manager) GetOrCreate(id string) (*Session, error) {
 	s, ok := m.sessions[id]
 	m.mu.RUnlock()
 
-	if ok && isAlive(s) {
-		return s, nil
+	if ok {
+		alive := isAlive(s)
+		log.Printf("[SESSION] GetOrCreate(%q): found existing session S%d, isAlive=%v (pid=%d)",
+			id, s.seqNo, alive, s.cmd.Process.Pid)
+		if alive {
+			return s, nil
+		}
+		log.Printf("[SESSION] GetOrCreate(%q): existing session S%d is DEAD, will create new", id, s.seqNo)
+	} else {
+		log.Printf("[SESSION] GetOrCreate(%q): no session in map, will create new", id)
 	}
 
 	m.mu.Lock()
@@ -136,8 +152,12 @@ func (m *Manager) GetOrCreate(id string) (*Session, error) {
 	// Double-check after acquiring write lock
 	s, ok = m.sessions[id]
 	if ok && isAlive(s) {
+		log.Printf("[SESSION] GetOrCreate(%q): double-check found alive session S%d, reusing", id, s.seqNo)
 		return s, nil
 	}
+
+	m.nextSeq++
+	seqNo := m.nextSeq
 
 	cmd := m.buildCommand(id)
 	ptmx, err := pty.Start(cmd)
@@ -145,10 +165,13 @@ func (m *Manager) GetOrCreate(id string) (*Session, error) {
 		return nil, fmt.Errorf("starting pty for %s: %w", id, err)
 	}
 
+	log.Printf("[SESSION] GetOrCreate(%q): CREATED new session S%d (pid=%d)", id, seqNo, cmd.Process.Pid)
+
 	s = &Session{
-		id:   id,
-		cmd:  cmd,
-		ptmx: ptmx,
+		id:    id,
+		seqNo: seqNo,
+		cmd:   cmd,
+		ptmx:  ptmx,
 	}
 	m.sessions[id] = s
 
@@ -157,6 +180,7 @@ func (m *Manager) GetOrCreate(id string) (*Session, error) {
 	// for the lifetime of the session, preventing duplicate readers
 	// when clients reconnect.
 	go func() {
+		log.Printf("[PTY-READER] S%d (%q): goroutine started", seqNo, id)
 		buf := make([]byte, 4096)
 		for {
 			n, err := s.ptmx.Read(buf)
@@ -164,13 +188,15 @@ func (m *Manager) GetOrCreate(id string) (*Session, error) {
 				s.mu.Lock()
 				if s.conn != nil {
 					if werr := s.conn.WriteMessage(websocket.BinaryMessage, buf[:n]); werr != nil {
-						// Write failed; conn will be replaced on next connect.
+						log.Printf("[PTY-READER] S%d (%q): write to WS C%d failed: %v, clearing conn",
+							seqNo, id, s.connSeq, werr)
 						s.conn = nil
 					}
 				}
 				s.mu.Unlock()
 			}
 			if err != nil {
+				log.Printf("[PTY-READER] S%d (%q): PTY read error (goroutine exiting): %v", seqNo, id, err)
 				return
 			}
 		}
@@ -178,11 +204,15 @@ func (m *Manager) GetOrCreate(id string) (*Session, error) {
 
 	// Cleanup: remove session from map when process exits.
 	go func() {
-		cmd.Wait()
+		err := cmd.Wait()
+		log.Printf("[SESSION] S%d (%q): process exited (err=%v, state=%v)", seqNo, id, err, cmd.ProcessState)
 		ptmx.Close()
 		m.mu.Lock()
 		if m.sessions[id] == s {
 			delete(m.sessions, id)
+			log.Printf("[SESSION] S%d (%q): removed from session map", seqNo, id)
+		} else {
+			log.Printf("[SESSION] S%d (%q): already replaced in session map, not removing", seqNo, id)
 		}
 		m.mu.Unlock()
 	}()
@@ -193,7 +223,7 @@ func (m *Manager) GetOrCreate(id string) (*Session, error) {
 func (m *Manager) ServeWebSocket(conn *websocket.Conn, id string) {
 	s, err := m.GetOrCreate(id)
 	if err != nil {
-		log.Printf("terminal %s: %v", id, err)
+		log.Printf("[WS] terminal %s: %v", id, err)
 		conn.WriteMessage(websocket.TextMessage, []byte("Error: "+err.Error()))
 		conn.Close()
 		return
@@ -203,16 +233,26 @@ func (m *Manager) ServeWebSocket(conn *websocket.Conn, id string) {
 	// onmessage handler stops firing (prevents duplicate output).
 	s.mu.Lock()
 	old := s.conn
+	s.connSeq++
+	cseq := s.connSeq
 	s.conn = conn
 	s.mu.Unlock()
+
+	hadOld := old != nil
 	if old != nil {
+		log.Printf("[WS] S%d (%q): swapped conn C%d → C%d (closing old)", s.seqNo, id, cseq-1, cseq)
 		old.Close()
+	} else {
+		log.Printf("[WS] S%d (%q): set conn C%d (no previous conn)", s.seqNo, id, cseq)
 	}
+	_ = hadOld
 
 	// Read input from this WebSocket and forward to PTY.
+	log.Printf("[WS] S%d (%q) C%d: entering read loop", s.seqNo, id, cseq)
 	for {
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
+			log.Printf("[WS] S%d (%q) C%d: read loop exiting: %v", s.seqNo, id, cseq, err)
 			break
 		}
 		switch msgType {
@@ -221,6 +261,7 @@ func (m *Manager) ServeWebSocket(conn *websocket.Conn, id string) {
 		case websocket.TextMessage:
 			var msg resizeMsg
 			if json.Unmarshal(data, &msg) == nil && msg.Type == "resize" {
+				log.Printf("[WS] S%d (%q) C%d: resize %dx%d", s.seqNo, id, cseq, msg.Cols, msg.Rows)
 				pty.Setsize(s.ptmx, &pty.Winsize{
 					Cols: msg.Cols,
 					Rows: msg.Rows,
@@ -231,8 +272,10 @@ func (m *Manager) ServeWebSocket(conn *websocket.Conn, id string) {
 
 	// If we're still the active connection, nil it out.
 	s.mu.Lock()
-	if s.conn == conn {
+	wasActive := s.conn == conn
+	if wasActive {
 		s.conn = nil
 	}
 	s.mu.Unlock()
+	log.Printf("[WS] S%d (%q) C%d: cleanup, wasActiveConn=%v", s.seqNo, id, cseq, wasActive)
 }
